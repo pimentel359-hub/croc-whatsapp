@@ -37,10 +37,19 @@ async function connectToWhatsApp() {
   sock = makeWASocket({
     auth: state,
     logger: pino({ level: "silent" }),
-    printQRInTerminal: false
+    printQRInTerminal: false,
+    markOnlineOnConnect: false, // CRUCIAL: Não envia status 'available' para NUNCA suprimir notificações no celular
+    syncFullHistory: false // Não sincroniza nem consome mensagens antigas do histórico
   });
 
   sock.ev.on("creds.update", saveCreds);
+
+  // MODO EXCLUSIVO DE ENVIO (UNIDIRECIONAL):
+  // Não consome, não lê e não marca nenhuma mensagem recebida como lida.
+  // As notificações sonoras, banners e vibração continuam tocando normalmente no telefone celular.
+  sock.ev.on("messages.upsert", async () => {
+    // Intencionalmente vazio: nenhuma ação de leitura é executada pela API
+  });
 
   sock.ev.on("connection.update", async (update) => {
     const { connection, lastDisconnect, qr } = update;
@@ -66,6 +75,13 @@ async function connectToWhatsApp() {
       currentQrCode = null;
       connectedUser = sock.user?.id || "Conectado";
       console.log("[Baileys] ✅ WhatsApp conectado com sucesso! Usuário:", connectedUser);
+      // Força a presença como 'unavailable' (invisível/segundo plano)
+      // para que o WhatsApp envie todas as notificações sonoras e visuais diretamente para o aparelho físico
+      try {
+        await sock.sendPresenceUpdate("unavailable");
+      } catch (errPres) {
+        console.warn("[Baileys] Aviso ao definir presença unavailable:", errPres.message);
+      }
     }
   });
 }
@@ -245,6 +261,12 @@ app.post("/send-message", checkAuth, async (req, res) => {
   try {
     const result = await sock.sendMessage(targetJid, { text: message });
     console.log(`[Baileys] ✅ Mensagem enviada para ${targetJid}`);
+
+    // Garante que o status volte a ficar invisível/unavailable para não silenciar o telefone
+    try {
+      await sock.sendPresenceUpdate("unavailable");
+    } catch (_) {}
+
     return res.json({
       success: true,
       destination: targetJid,
@@ -362,6 +384,24 @@ app.post("/api/mercadopago/create-pix", async (req, res) => {
   }
 });
 
+// 6. Rota para Forçar Presença em Segundo Plano (Invisível / Unavailable)
+// Garante que o WhatsApp nunca considere a API como tela ativa e libere todas as notificações no celular
+app.get("/set-offline", async (req, res) => {
+  if (!sock) {
+    return res.status(503).json({ success: false, error: "WhatsApp não está conectado." });
+  }
+  try {
+    await sock.sendPresenceUpdate("unavailable");
+    return res.json({
+      success: true,
+      presence: "unavailable",
+      message: "Presença definida como invisível/segundo plano. Notificações do celular liberadas com sucesso!"
+    });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`=======================================================`);
   console.log(`🥟 Servidor Baileys Croc & Cia rodando na porta ${PORT}`);
@@ -369,4 +409,15 @@ app.listen(PORT, () => {
   console.log(`👉 QR Code: http://localhost:${PORT}/qr`);
   console.log(`👉 Envio: POST http://localhost:${PORT}/send-message`);
   console.log(`=======================================================`);
+
+  // Keep-Alive anti-hibernação do Render (ping a cada 8 minutos para evitar desligamento)
+  const PING_TARGET = process.env.RENDER_EXTERNAL_URL || "https://croc-whatsapp.onrender.com";
+  setInterval(() => {
+    try {
+      const https = require("https");
+      https.get(`${PING_TARGET}/status`, (r) => {
+        // ping ok
+      }).on("error", () => {});
+    } catch (e) {}
+  }, 8 * 60 * 1000);
 });
