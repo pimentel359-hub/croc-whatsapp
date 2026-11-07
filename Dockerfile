@@ -1,15 +1,21 @@
-FROM node:20-alpine
+FROM node:20-slim
 
 WORKDIR /app
 
-# Instala dependências de produção
-COPY package*.json ./
-RUN npm install --production
+# Instala ferramentas essenciais para os módulos criptográficos do Baileys
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 \
+    make \
+    g++ \
+    git \
+    && rm -rf /var/lib/apt/lists/*
 
-# Copia o código do microserviço
+COPY package*.json ./
+
+RUN npm install
+
 COPY server.js ./
 
-# Cria diretório para persistência da sessão Baileys
 RUN mkdir -p auth_info_baileys
 
 EXPOSE 3000
