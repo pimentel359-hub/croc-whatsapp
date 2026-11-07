@@ -172,44 +172,90 @@ app.get("/qr", async (req, res) => {
   }
 });
 
-// 3. Rota de Envio de Mensagem de Texto
+// 3. Rota de Envio de Mensagem de Texto (Suporte a JID, LID e Telefone)
 app.post("/send-message", checkAuth, async (req, res) => {
   if (!isConnected || !sock) {
     return res.status(503).json({
       success: false,
-      error: "WhatsApp não está conectado. Acesse http://localhost:3000/qr para conectar."
+      error: "WhatsApp não está conectado. Acesse /qr para conectar."
     });
   }
 
-  const phone = req.body.phone || req.body.number;
+  const rawDest = String(req.body.phone || req.body.number || req.body.jid || req.body.lid || req.body.to || "").trim();
   const message = req.body.message || req.body.text;
 
-  if (!phone || !message) {
+  if (!rawDest || !message) {
     return res.status(400).json({
       success: false,
-      error: "Campos 'phone' e 'message' são obrigatórios."
+      error: "Campos 'phone'/'jid'/'lid' e 'message' são obrigatórios."
     });
   }
 
-  let cleanPhone = String(phone).replace(/\D/g, "");
-  if (cleanPhone.length === 10 || cleanPhone.length === 11) {
-    cleanPhone = "55" + cleanPhone;
+  let targetJid = null;
+  const cleanDigits = rawDest.replace(/\D/g, "");
+
+  // 1. Caso o destino seja o próprio estabelecimento (Pastelaria / Loja)
+  const isPastelaria = rawDest === "pastelaria" || rawDest === "self" || rawDest === "admin" ||
+                       cleanDigits === "5581991896473" || cleanDigits === "558191896473" ||
+                       cleanDigits === "81991896473" || cleanDigits === "8191896473";
+
+  if (isPastelaria && sock.user?.id) {
+    targetJid = sock.user.id.split(":")[0] + "@s.whatsapp.net";
+  } else if (rawDest.includes("@lid") || rawDest.includes("@s.whatsapp.net") || rawDest.includes("@g.us")) {
+    // 2. Destino já informado com sufixo @lid ou @s.whatsapp.net
+    targetJid = rawDest;
+  } else {
+    // 3. Número de telefone a ser resolvido
+    let cleanPhone = cleanDigits;
+    if (cleanPhone.length === 10 || cleanPhone.length === 11) {
+      cleanPhone = "55" + cleanPhone;
+    }
+
+    try {
+      if (typeof sock.onWhatsApp === "function") {
+        // Tenta resolver o JID / LID oficial pelo Baileys
+        const checkResults = await sock.onWhatsApp(cleanPhone);
+        if (checkResults && checkResults.length > 0 && checkResults[0]?.exists) {
+          targetJid = checkResults[0].jid;
+        } else if (cleanPhone.startsWith("55") && cleanPhone.length === 13) {
+          // Tenta sem o 9º dígito
+          const withoutNine = cleanPhone.slice(0, 4) + cleanPhone.slice(5);
+          const checkWithoutNine = await sock.onWhatsApp(withoutNine);
+          if (checkWithoutNine && checkWithoutNine.length > 0 && checkWithoutNine[0]?.exists) {
+            targetJid = checkWithoutNine[0].jid;
+          }
+        } else if (cleanPhone.startsWith("55") && cleanPhone.length === 12) {
+          // Tenta com o 9º dígito
+          const withNine = cleanPhone.slice(0, 4) + "9" + cleanPhone.slice(4);
+          const checkWithNine = await sock.onWhatsApp(withNine);
+          if (checkWithNine && checkWithNine.length > 0 && checkWithNine[0]?.exists) {
+            targetJid = checkWithNine[0].jid;
+          }
+        }
+      }
+    } catch (errCheck) {
+      console.warn("[Baileys] Erro ao consultar onWhatsApp:", errCheck.message);
+    }
+
+    if (!targetJid) {
+      targetJid = `${cleanPhone}@s.whatsapp.net`;
+    }
   }
 
-  const jid = `${cleanPhone}@s.whatsapp.net`;
-
   try {
-    const result = await sock.sendMessage(jid, { text: message });
-    console.log(`[Baileys] ✅ Mensagem enviada para ${cleanPhone}`);
+    const result = await sock.sendMessage(targetJid, { text: message });
+    console.log(`[Baileys] ✅ Mensagem enviada para ${targetJid}`);
     return res.json({
       success: true,
-      phone: cleanPhone,
+      destination: targetJid,
+      phone: cleanDigits,
       messageId: result?.key?.id
     });
   } catch (err) {
-    console.error(`[Baileys] ❌ Erro ao enviar para ${cleanPhone}:`, err);
+    console.error(`[Baileys] ❌ Erro ao enviar para ${targetJid}:`, err);
     return res.status(500).json({
       success: false,
+      destination: targetJid,
       error: err.message
     });
   }
