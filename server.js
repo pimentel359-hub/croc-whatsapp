@@ -40,6 +40,39 @@ let connectedUser = null;
 let isConnecting = false;
 let reconnectTimer = null;
 let consecutiveErrors = 0;
+let presenceInterval = null;
+
+// Função para manter o Baileys 100% invisível em segundo plano (unavailable)
+// Isso impede que o WhatsApp ache que há uma tela de computador aberta e libera todas as notificações no celular
+function startPresenceLoop() {
+  if (presenceInterval) {
+    clearInterval(presenceInterval);
+    presenceInterval = null;
+  }
+
+  // Envia presença 'unavailable' imediatamente
+  if (sock && isConnected) {
+    sock.sendPresenceUpdate("unavailable").catch(() => {});
+  }
+
+  // Renovação periódica a cada 20 segundos
+  presenceInterval = setInterval(async () => {
+    if (isConnected && sock) {
+      try {
+        await sock.sendPresenceUpdate("unavailable");
+      } catch (_) {}
+    }
+  }, 20000);
+
+  console.log("[Baileys] 🔕 Modo invisível ativo: presença 'unavailable' sendo renovada continuamente a cada 20s.");
+}
+
+function stopPresenceLoop() {
+  if (presenceInterval) {
+    clearInterval(presenceInterval);
+    presenceInterval = null;
+  }
+}
 
 // Função para limpar credenciais expiradas/corrompidas
 function cleanAuthFolder() {
@@ -149,6 +182,7 @@ async function connectToWhatsApp() {
       if (connection === "close") {
         isConnected = false;
         connectedUser = null;
+        stopPresenceLoop();
 
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         console.log(`[Baileys] ⚠️ Conexão encerrada. Código: ${statusCode} - ${lastDisconnect?.error?.message || ""}`);
@@ -183,6 +217,7 @@ async function connectToWhatsApp() {
         consecutiveErrors = 0;
         connectedUser = sock.user?.id || "Conectado";
         console.log("[Baileys] ✅ WhatsApp conectado com sucesso! Usuário:", connectedUser);
+        startPresenceLoop();
       }
     });
 
@@ -448,8 +483,13 @@ app.post("/send-message", checkAuth, async (req, res) => {
     const result = await sock.sendMessage(targetJid, { text: message });
     console.log(`[Baileys] ✅ Mensagem enviada com sucesso para ${targetJid} (ID: ${result?.key?.id})`);
 
-    // Não alteramos a presença para "unavailable" após o envio.
-    // Isso preserva a pilha de push notifications no aparelho físico do cliente e da loja.
+    // MODO OCULTO: Logo após o envio, re-força a presença como 'unavailable' (invisível/segundo plano)
+    // Isso garante que o WhatsApp NUNCA considere a tela do computador aberta e libere as notificações no celular
+    setTimeout(async () => {
+      try {
+        await sock?.sendPresenceUpdate("unavailable");
+      } catch (_) {}
+    }, 500);
 
     return res.json({
       success: true,
@@ -569,16 +609,17 @@ app.post("/api/mercadopago/create-pix", async (req, res) => {
 });
 
 // 6. Rota para Forçar Presença em Segundo Plano (Invisível / Unavailable)
-app.get("/set-offline", async (req, res) => {
+app.all(["/set-offline", "/hide", "/invisible"], async (req, res) => {
   if (!sock) {
     return res.status(503).json({ success: false, error: "WhatsApp não está conectado." });
   }
   try {
-    await sock.sendPresenceUpdate("unavailable");
+    startPresenceLoop();
     return res.json({
       success: true,
       presence: "unavailable",
-      message: "Presença definida como segundo plano com sucesso!"
+      mode: "loop_20s",
+      message: "Modo invisível reativado! Presença mantida como segundo plano (unavailable) a cada 20s para liberar notificações no celular."
     });
   } catch (err) {
     return res.status(500).json({ success: false, error: err.message });
