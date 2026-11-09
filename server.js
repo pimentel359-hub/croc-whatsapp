@@ -45,6 +45,7 @@ let connectedUser = null;
 let isConnecting = false;
 let reconnectTimer = null;
 let consecutiveErrors = 0;
+let ghostModeInterval = null;
 
 // Cache do ID do grupo de pedidos para resposta ultra-rápida sem consultar o WhatsApp a cada mensagem
 let cachedOrderGroupId = null;
@@ -208,6 +209,12 @@ async function connectToWhatsApp() {
           storeMessage(m.key.id, m.message);
         }
       }
+      // Reafirma modo segundo plano (Ghost Mode) para o WhatsApp entregar com som e vibração no celular físico
+      setTimeout(() => {
+        if (sock && isConnected) {
+          sock.sendPresenceUpdate("unavailable").catch(() => {});
+        }
+      }, 1000);
     });
 
     sock.ev.on("connection.update", async (update) => {
@@ -224,6 +231,10 @@ async function connectToWhatsApp() {
         isConnected = false;
         connectedUser = null;
         cachedOrderGroupId = null;
+        if (ghostModeInterval) {
+          clearInterval(ghostModeInterval);
+          ghostModeInterval = null;
+        }
 
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         console.log(`[Baileys] ⚠️ Conexão encerrada. Código: ${statusCode} - ${lastDisconnect?.error?.message || ""}`);
@@ -259,10 +270,21 @@ async function connectToWhatsApp() {
         connectedUser = sock.user?.id || "Conectado";
         console.log("[Baileys] ✅ WhatsApp conectado com sucesso! Usuário:", connectedUser);
         
-        // Define presença em segundo plano de forma passiva (apenas uma vez, sem loop agressivo)
+        // Define presença em segundo plano de forma passiva (Ghost Mode)
         try {
           sock.sendPresenceUpdate("unavailable").catch(() => {});
         } catch (_) {}
+
+        // Loop permanente para manter o robô 100% em segundo plano (Ghost Mode)
+        // Isso impede que os servidores da Meta silenciem as notificações sonoras e vibratórias no celular
+        if (ghostModeInterval) clearInterval(ghostModeInterval);
+        ghostModeInterval = setInterval(async () => {
+          if (sock && isConnected) {
+            try {
+              await sock.sendPresenceUpdate("unavailable");
+            } catch (_) {}
+          }
+        }, 20000);
 
         // Busca antecipadamente o grupo de pedidos
         setTimeout(findOrderGroupJid, 2000);
@@ -552,6 +574,13 @@ app.post("/send-message", checkAuth, async (req, res) => {
     if (result?.key?.id && result?.message) {
       storeMessage(result.key.id, result.message);
     }
+
+    // Reafirma presença invisível em segundo plano após envio
+    setTimeout(() => {
+      if (sock && isConnected) {
+        sock.sendPresenceUpdate("unavailable").catch(() => {});
+      }
+    }, 800);
 
     return res.json({
       success: true,
