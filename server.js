@@ -1,13 +1,16 @@
 /**
- * PASTELARIA CROC & CIA - SERVIDOR BAILEYS WHATSAPP v2.0
+ * PASTELARIA CROC & CIA - SERVIDOR BAILEYS WHATSAPP v2.5
  * Microserviço oficial para automação de confirmação de pedidos, notificações de entrega e status Pix.
  * 
- * Melhorias v2.0:
- * - Auto-reconexão inteligente com regeneração automática de QR Code em caso de logout / queda
- * - Limpeza automática de credenciais expiradas (elimina necessidade de reiniciar serviço no Render)
- * - Versão dinâmica do WhatsApp Web (fetchLatestBaileysVersion) para evitar atraso/desync no app do celular
- * - Suporte a push notifications completas no celular (elimina corte abrupto de presença)
- * - Rotas de resgate: /reset-session e /reconnect para controle direto pelo painel de retaguarda
+ * Melhorias v2.5:
+ * - SOLUÇÃO DEFINITIVA PARA "Aguardando essa mensagem. Isso pode levar alguns instantes":
+ *   Implementação de 'getMessage' e 'msgRetryCounterCache' para responder instantaneamente
+ *   às solicitações de retry criptográfico E2EE do WhatsApp, eliminando travamentos de mensagens.
+ * - Sincronização em tempo real de mensagens enviadas e recebidas com retenção em cache LRU.
+ * - Remoção do loop agressivo de presença que impedia o WhatsApp de considerar o celular livre para tocar.
+ * - Modo passivo inteligente (markOnlineOnConnect: false) para preservar toques e notificações do celular físico.
+ * - Auto-reconexão inteligente com regeneração automática de QR Code em caso de logout / queda.
+ * - Rotas de resgate: /reset-session e /reconnect para controle direto pelo painel de retaguarda.
  */
 
 const express = require("express");
@@ -40,38 +43,33 @@ let connectedUser = null;
 let isConnecting = false;
 let reconnectTimer = null;
 let consecutiveErrors = 0;
-let presenceInterval = null;
 
-// Função para manter o Baileys 100% invisível em segundo plano (unavailable)
-// Isso impede que o WhatsApp ache que há uma tela de computador aberta e libera todas as notificações no celular
-function startPresenceLoop() {
-  if (presenceInterval) {
-    clearInterval(presenceInterval);
-    presenceInterval = null;
-  }
-
-  // Envia presença 'unavailable' imediatamente
-  if (sock && isConnected) {
-    sock.sendPresenceUpdate("unavailable").catch(() => {});
-  }
-
-  // Renovação periódica a cada 20 segundos
-  presenceInterval = setInterval(async () => {
-    if (isConnected && sock) {
-      try {
-        await sock.sendPresenceUpdate("unavailable");
-      } catch (_) {}
+// 1. Cache para controle de retentativas de decodificação E2EE do WhatsApp
+const msgRetryCounterCache = {
+  _cache: new Map(),
+  get(key) { return this._cache.get(key); },
+  set(key, val) {
+    if (this._cache.size > 2000) {
+      const first = this._cache.keys().next().value;
+      this._cache.delete(first);
     }
-  }, 20000);
+    this._cache.set(key, val);
+  },
+  del(key) { this._cache.delete(key); },
+  flushAll() { this._cache.clear(); }
+};
 
-  console.log("[Baileys] 🔕 Modo invisível ativo: presença 'unavailable' sendo renovada continuamente a cada 20s.");
-}
-
-function stopPresenceLoop() {
-  if (presenceInterval) {
-    clearInterval(presenceInterval);
-    presenceInterval = null;
+// 2. Armazém em memória de mensagens para atender chamadas de retry via 'getMessage'
+// É essa função que faz o WhatsApp do celular decifrar a mensagem imediatamente,
+// eliminando a mensagem "Aguardando essa mensagem. Isso pode levar alguns instantes"
+const messageStore = new Map();
+function storeMessage(keyId, messageProto) {
+  if (!keyId || !messageProto) return;
+  if (messageStore.size > 3000) {
+    const first = messageStore.keys().next().value;
+    messageStore.delete(first);
   }
+  messageStore.set(keyId, messageProto);
 }
 
 // Função para limpar credenciais expiradas/corrompidas
@@ -126,8 +124,7 @@ async function connectToWhatsApp() {
 
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
 
-    // Obtém versão mais recente do WhatsApp Web para que os servidores do WhatsApp
-    // roteiem as mensagens instantaneamente para o celular e para o WhatsApp Web
+    // Obtém versão mais recente do WhatsApp Web para manter paridade criptográfica total
     let version = [2, 3000, 1015901307];
     try {
       if (typeof fetchLatestBaileysVersion === "function") {
@@ -146,11 +143,18 @@ async function connectToWhatsApp() {
       auth: state,
       logger: pino({ level: "silent" }),
       printQRInTerminal: false,
-      markOnlineOnConnect: false, // Não altera o status para online no momento da conexão
+      markOnlineOnConnect: false, // Fundamental para não roubar o status online do celular principal
       syncFullHistory: false,
       connectTimeoutMs: 60000,
       keepAliveIntervalMs: 25000,
-      defaultQueryTimeoutMs: 60000
+      defaultQueryTimeoutMs: 60000,
+      msgRetryCounterCache, // Permite rastrear tentativas de decodificação E2EE
+      getMessage: async (key) => {
+        // Responde às solicitações de retry do WhatsApp quando o celular precisa decodificar a mensagem
+        if (!key || !key.id) return undefined;
+        const msg = messageStore.get(key.id);
+        return msg || undefined;
+      }
     };
 
     if (typeof Browsers !== "undefined" && Browsers.appropriate) {
@@ -163,10 +167,15 @@ async function connectToWhatsApp() {
 
     sock.ev.on("creds.update", saveCreds);
 
-    // MODO EXCLUSIVO DE ENVIO (UNIDIRECIONAL):
-    // Não marca mensagens recebidas como lidas para não suprimir notificações do telefone
-    sock.ev.on("messages.upsert", async () => {
-      // Intencionalmente vazio
+    // Captura mensagens recebidas para alimentar o armazém de retry (getMessage)
+    // Sem marcar como lidas para preservar notificações de novas mensagens no celular
+    sock.ev.on("messages.upsert", async ({ messages, type }) => {
+      if (!messages || !Array.isArray(messages)) return;
+      for (const m of messages) {
+        if (m?.key?.id && m?.message) {
+          storeMessage(m.key.id, m.message);
+        }
+      }
     });
 
     sock.ev.on("connection.update", async (update) => {
@@ -182,7 +191,6 @@ async function connectToWhatsApp() {
       if (connection === "close") {
         isConnected = false;
         connectedUser = null;
-        stopPresenceLoop();
 
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         console.log(`[Baileys] ⚠️ Conexão encerrada. Código: ${statusCode} - ${lastDisconnect?.error?.message || ""}`);
@@ -217,7 +225,11 @@ async function connectToWhatsApp() {
         consecutiveErrors = 0;
         connectedUser = sock.user?.id || "Conectado";
         console.log("[Baileys] ✅ WhatsApp conectado com sucesso! Usuário:", connectedUser);
-        startPresenceLoop();
+        
+        // Define presença em segundo plano de forma passiva (apenas uma vez, sem loop agressivo)
+        try {
+          sock.sendPresenceUpdate("unavailable").catch(() => {});
+        } catch (_) {}
       }
     });
 
@@ -248,6 +260,7 @@ app.get("/status", (req, res) => {
     connected: isConnected,
     user: connectedUser,
     hasQrCode: !!currentQrCode,
+    cachedMessages: messageStore.size,
     uptime: process.uptime(),
     timestamp: new Date().toISOString()
   });
@@ -284,7 +297,7 @@ app.get("/qr", async (req, res) => {
             <span>●</span> WhatsApp Online &amp; Conectado
           </div>
           <h2 style="margin: 0 0 10px 0; color: #FFFFFF;">🥟 Pastelaria Croc &amp; Cia</h2>
-          <p style="color: #9CA3AF; margin: 0 0 15px 0; font-size: 0.95rem;">O microserviço Baileys está ativo e enviando notificações de pedidos normalmente.</p>
+          <p style="color: #9CA3AF; margin: 0 0 15px 0; font-size: 0.95rem;">O microserviço Baileys está ativo e sincronizado com resposta instantânea de retry criptográfico.</p>
           
           <div class="user-box">
             ${connectedUser}
@@ -413,7 +426,7 @@ app.get("/qr", async (req, res) => {
   }
 });
 
-// 3. Rota de Envio de Mensagem de Texto (Suporte a JID, LID e Telefone)
+// 3. Rota de Envio de Mensagem de Texto (Suporte a JID, Grupos, LID e Telefone)
 app.post("/send-message", checkAuth, async (req, res) => {
   if (!isConnected || !sock) {
     return res.status(503).json({
@@ -483,13 +496,11 @@ app.post("/send-message", checkAuth, async (req, res) => {
     const result = await sock.sendMessage(targetJid, { text: message });
     console.log(`[Baileys] ✅ Mensagem enviada com sucesso para ${targetJid} (ID: ${result?.key?.id})`);
 
-    // MODO OCULTO: Logo após o envio, re-força a presença como 'unavailable' (invisível/segundo plano)
-    // Isso garante que o WhatsApp NUNCA considere a tela do computador aberta e libere as notificações no celular
-    setTimeout(async () => {
-      try {
-        await sock?.sendPresenceUpdate("unavailable");
-      } catch (_) {}
-    }, 500);
+    // Armazena a mensagem enviada no cache de retry para que o celular e o WhatsApp
+    // consigam resolver a chave criptográfica E2EE instantaneamente sem travar em 'Aguardando essa mensagem'
+    if (result?.key?.id && result?.message) {
+      storeMessage(result.key.id, result.message);
+    }
 
     return res.json({
       success: true,
@@ -614,12 +625,11 @@ app.all(["/set-offline", "/hide", "/invisible"], async (req, res) => {
     return res.status(503).json({ success: false, error: "WhatsApp não está conectado." });
   }
   try {
-    startPresenceLoop();
+    await sock.sendPresenceUpdate("unavailable").catch(() => {});
     return res.json({
       success: true,
       presence: "unavailable",
-      mode: "loop_20s",
-      message: "Modo invisível reativado! Presença mantida como segundo plano (unavailable) a cada 20s para liberar notificações no celular."
+      message: "Presença definida como segundo plano (unavailable) com sucesso!"
     });
   } catch (err) {
     return res.status(500).json({ success: false, error: err.message });
@@ -680,7 +690,7 @@ app.all(["/reconnect", "/restart"], async (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`=======================================================`);
-  console.log(`🥟 Servidor Baileys Croc & Cia v2.0 rodando na porta ${PORT}`);
+  console.log(`🥟 Servidor Baileys Croc & Cia v2.5 rodando na porta ${PORT}`);
   console.log(`👉 Status: http://localhost:${PORT}/status`);
   console.log(`👉 QR Code: http://localhost:${PORT}/qr`);
   console.log(`👉 Reset QR: http://localhost:${PORT}/reset-session`);
