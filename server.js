@@ -1,16 +1,18 @@
 /**
- * PASTELARIA CROC & CIA - SERVIDOR BAILEYS WHATSAPP v2.5
+ * PASTELARIA CROC & CIA - SERVIDOR BAILEYS WHATSAPP v2.6
  * Microserviço oficial para automação de confirmação de pedidos, notificações de entrega e status Pix.
  * 
- * Melhorias v2.5:
+ * Novidades v2.6:
+ * - ROTEAMENTO INTELIGENTE PARA O GRUPO "Pedidos Croc & Cia":
+ *   Todo aviso de novo pedido para a pastelaria é enviado automaticamente para o grupo de pedidos,
+ *   fazendo o celular da loja (e de todos os atendentes do grupo) TOCAR ALTO com som, vibração e banner!
  * - SOLUÇÃO DEFINITIVA PARA "Aguardando essa mensagem. Isso pode levar alguns instantes":
  *   Implementação de 'getMessage' e 'msgRetryCounterCache' para responder instantaneamente
  *   às solicitações de retry criptográfico E2EE do WhatsApp, eliminando travamentos de mensagens.
  * - Sincronização em tempo real de mensagens enviadas e recebidas com retenção em cache LRU.
- * - Remoção do loop agressivo de presença que impedia o WhatsApp de considerar o celular livre para tocar.
  * - Modo passivo inteligente (markOnlineOnConnect: false) para preservar toques e notificações do celular físico.
  * - Auto-reconexão inteligente com regeneração automática de QR Code em caso de logout / queda.
- * - Rotas de resgate: /reset-session e /reconnect para controle direto pelo painel de retaguarda.
+ * - Rotas de resgate: /reset-session, /reconnect, /groups para controle direto pelo painel de retaguarda.
  */
 
 const express = require("express");
@@ -44,6 +46,10 @@ let isConnecting = false;
 let reconnectTimer = null;
 let consecutiveErrors = 0;
 
+// Cache do ID do grupo de pedidos para resposta ultra-rápida sem consultar o WhatsApp a cada mensagem
+let cachedOrderGroupId = null;
+let lastGroupCheck = 0;
+
 // 1. Cache para controle de retentativas de decodificação E2EE do WhatsApp
 const msgRetryCounterCache = {
   _cache: new Map(),
@@ -70,6 +76,32 @@ function storeMessage(keyId, messageProto) {
     messageStore.delete(first);
   }
   messageStore.set(keyId, messageProto);
+}
+
+// Localiza o JID do grupo "Pedidos Croc & Cia"
+async function findOrderGroupJid() {
+  const now = Date.now();
+  if (cachedOrderGroupId && (now - lastGroupCheck) < 60000) {
+    return cachedOrderGroupId;
+  }
+  if (!sock || !isConnected || typeof sock.groupFetchAllParticipating !== "function") {
+    return cachedOrderGroupId;
+  }
+  try {
+    const groups = await sock.groupFetchAllParticipating();
+    const found = Object.values(groups).find(g => 
+      g.subject && /pedidos\s*croc/i.test(g.subject)
+    );
+    if (found && found.id) {
+      cachedOrderGroupId = found.id;
+      lastGroupCheck = now;
+      console.log(`[Baileys] 📢 Grupo de Pedidos localizado com sucesso: "${found.subject}" (${cachedOrderGroupId})`);
+      return cachedOrderGroupId;
+    }
+  } catch (err) {
+    console.warn("[Baileys] Aviso ao consultar grupos:", err.message);
+  }
+  return cachedOrderGroupId;
 }
 
 // Função para limpar credenciais expiradas/corrompidas
@@ -191,6 +223,7 @@ async function connectToWhatsApp() {
       if (connection === "close") {
         isConnected = false;
         connectedUser = null;
+        cachedOrderGroupId = null;
 
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         console.log(`[Baileys] ⚠️ Conexão encerrada. Código: ${statusCode} - ${lastDisconnect?.error?.message || ""}`);
@@ -230,6 +263,9 @@ async function connectToWhatsApp() {
         try {
           sock.sendPresenceUpdate("unavailable").catch(() => {});
         } catch (_) {}
+
+        // Busca antecipadamente o grupo de pedidos
+        setTimeout(findOrderGroupJid, 2000);
       }
     });
 
@@ -261,6 +297,8 @@ app.get("/status", (req, res) => {
     user: connectedUser,
     hasQrCode: !!currentQrCode,
     cachedMessages: messageStore.size,
+    orderGroupFound: !!cachedOrderGroupId,
+    orderGroupId: cachedOrderGroupId,
     uptime: process.uptime(),
     timestamp: new Date().toISOString()
   });
@@ -269,6 +307,10 @@ app.get("/status", (req, res) => {
 // 2. Rota para Visualizar o QR Code no Navegador com Controles de Resgate
 app.get("/qr", async (req, res) => {
   if (isConnected) {
+    const groupInfo = cachedOrderGroupId 
+      ? `<div style="background: rgba(34, 197, 94, 0.1); border: 1px solid #22C55E; color: #86EFAC; padding: 10px; border-radius: 8px; font-size: 0.85rem; margin: 10px 0;">🔔 Grupo "Pedidos Croc & Cia" conectado! Alertas tocarão no celular.</div>`
+      : `<div style="background: rgba(234, 179, 8, 0.1); border: 1px solid #EAB308; color: #FDE047; padding: 10px; border-radius: 8px; font-size: 0.85rem; margin: 10px 0;">⏳ Aguardando localização do grupo "Pedidos Croc & Cia"...</div>`;
+
     return res.send(`
       <!DOCTYPE html>
       <html lang="pt-BR">
@@ -280,8 +322,8 @@ app.get("/qr", async (req, res) => {
           body { font-family: system-ui, -apple-system, sans-serif; background: #0F0914; color: #FFFFFF; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; padding: 20px; box-sizing: border-box; }
           .card { background: #1B1224; border: 1px solid #7E22CE; padding: 35px 30px; border-radius: 20px; box-shadow: 0 10px 40px rgba(0,0,0,0.6); max-width: 480px; width: 100%; text-align: center; }
           .badge-online { display: inline-flex; align-items: center; gap: 8px; background: rgba(34, 197, 94, 0.15); border: 1px solid #22C55E; color: #4ADE80; padding: 6px 16px; border-radius: 9999px; font-weight: 700; font-size: 0.95rem; margin-bottom: 20px; }
-          .user-box { background: rgba(0,0,0,0.3); border: 1px solid #374151; padding: 12px; border-radius: 10px; font-family: monospace; font-size: 1rem; color: #F3F4F6; margin: 15px 0 25px 0; word-break: break-all; }
-          .btn-group { display: flex; flex-direction: column; gap: 12px; }
+          .user-box { background: rgba(0,0,0,0.3); border: 1px solid #374151; padding: 12px; border-radius: 10px; font-family: monospace; font-size: 1rem; color: #F3F4F6; margin: 15px 0 15px 0; word-break: break-all; }
+          .btn-group { display: flex; flex-direction: column; gap: 12px; margin-top: 15px; }
           .btn { display: inline-flex; align-items: center; justify-content: center; gap: 8px; padding: 12px 20px; border-radius: 12px; font-weight: 700; font-size: 0.95rem; text-decoration: none; cursor: pointer; transition: all 0.2s; border: none; }
           .btn-primary { background: #7E22CE; color: white; }
           .btn-primary:hover { background: #9333EA; }
@@ -297,15 +339,17 @@ app.get("/qr", async (req, res) => {
             <span>●</span> WhatsApp Online &amp; Conectado
           </div>
           <h2 style="margin: 0 0 10px 0; color: #FFFFFF;">🥟 Pastelaria Croc &amp; Cia</h2>
-          <p style="color: #9CA3AF; margin: 0 0 15px 0; font-size: 0.95rem;">O microserviço Baileys está ativo e sincronizado com resposta instantânea de retry criptográfico.</p>
+          <p style="color: #9CA3AF; margin: 0 0 10px 0; font-size: 0.95rem;">O microserviço Baileys está ativo com decodificação instantânea de chaves e roteamento para o grupo de pedidos.</p>
           
           <div class="user-box">
             ${connectedUser}
           </div>
 
+          ${groupInfo}
+
           <div class="btn-group">
             <button class="btn btn-primary" onclick="testSend()">
-              💬 Enviar Mensagem de Teste
+              💬 Enviar Mensagem de Teste no Grupo
             </button>
             <button class="btn btn-danger" onclick="confirmReset()">
               🔄 Desconectar e Gerar Novo QR Code
@@ -323,19 +367,17 @@ app.get("/qr", async (req, res) => {
             }
           }
           async function testSend() {
-            const phone = prompt("Digite o número para o teste (com DDD):", "81991896473");
-            if (!phone) return;
             const res = await fetch("/send-message", {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({
-                phone: phone,
-                message: "🥟 Teste de envio da Pastelaria Croc & Cia! Conexão ativa e sincronizada com sucesso."
+                phone: "pastelaria",
+                message: "🥟 Teste de envio no grupo Pedidos Croc & Cia! Conexão ativa, notificações e toques liberados no celular."
               })
             });
             const data = await res.json();
             if (data.success) {
-              alert("✅ Mensagem de teste enviada com sucesso para " + phone + "!");
+              alert("✅ Mensagem de teste enviada com sucesso! Destino: " + data.destination);
             } else {
               alert("❌ Falha no teste: " + (data.error || "Erro desconhecido"));
             }
@@ -449,13 +491,22 @@ app.post("/send-message", checkAuth, async (req, res) => {
   let targetJid = null;
   const cleanDigits = rawDest.replace(/\D/g, "");
 
-  // 1. Caso o destino seja o próprio estabelecimento (Pastelaria / Loja)
+  // 1. Caso o destino seja o próprio estabelecimento (Pastelaria / Loja) ou o Grupo de Pedidos
   const isPastelaria = rawDest === "pastelaria" || rawDest === "self" || rawDest === "admin" ||
+                       rawDest === "pedidos" || rawDest === "grupo" ||
                        cleanDigits === "5581991896473" || cleanDigits === "558191896473" ||
                        cleanDigits === "81991896473" || cleanDigits === "8191896473";
 
-  if (isPastelaria && sock.user?.id) {
-    targetJid = sock.user.id.split(":")[0] + "@s.whatsapp.net";
+  if (isPastelaria) {
+    // Tenta primeiro direcionar para o Grupo "Pedidos Croc & Cia" para que o celular toque alto com notificação
+    const groupJid = await findOrderGroupJid();
+    if (groupJid) {
+      targetJid = groupJid;
+      console.log(`[Baileys] 📢 Alerta de pedido roteado para o Grupo: ${targetJid}`);
+    } else if (sock.user?.id) {
+      targetJid = sock.user.id.split(":")[0] + "@s.whatsapp.net";
+      console.log(`[Baileys] ⚠️ Grupo de pedidos não localizado, enviando para self-chat: ${targetJid}`);
+    }
   } else if (rawDest.includes("@lid") || rawDest.includes("@s.whatsapp.net") || rawDest.includes("@g.us")) {
     targetJid = rawDest;
   } else {
@@ -518,7 +569,30 @@ app.post("/send-message", checkAuth, async (req, res) => {
   }
 });
 
-// 4. Rota Proxy para Testar Conexão com Mercado Pago (Zero CORS)
+// 4. Rota para Listar Grupos Participantes (Diagnóstico)
+app.get("/groups", checkAuth, async (req, res) => {
+  if (!isConnected || !sock) {
+    return res.status(503).json({ success: false, error: "WhatsApp não está conectado." });
+  }
+  try {
+    const groups = await sock.groupFetchAllParticipating();
+    const list = Object.values(groups).map(g => ({
+      id: g.id,
+      name: g.subject,
+      participantsCount: g.participants?.length || 0
+    }));
+    return res.json({
+      success: true,
+      count: list.length,
+      orderGroupJid: cachedOrderGroupId,
+      groups: list
+    });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// 5. Rota Proxy para Testar Conexão com Mercado Pago (Zero CORS)
 app.post("/api/mercadopago/test", async (req, res) => {
   const token = (req.body.accessToken || req.headers.authorization || "").replace(/^Bearer\s+/i, "").trim();
   if (!token) {
@@ -559,7 +633,7 @@ app.post("/api/mercadopago/test", async (req, res) => {
   }
 });
 
-// 5. Rota Proxy para Criar Pix Oficial no Mercado Pago (Zero CORS)
+// 6. Rota Proxy para Criar Pix Oficial no Mercado Pago (Zero CORS)
 app.post("/api/mercadopago/create-pix", async (req, res) => {
   const token = (req.body.accessToken || req.headers.authorization || "").replace(/^Bearer\s+/i, "").trim();
   if (!token) {
@@ -619,7 +693,7 @@ app.post("/api/mercadopago/create-pix", async (req, res) => {
   }
 });
 
-// 6. Rota para Forçar Presença em Segundo Plano (Invisível / Unavailable)
+// 7. Rota para Forçar Presença em Segundo Plano (Invisível / Unavailable)
 app.all(["/set-offline", "/hide", "/invisible"], async (req, res) => {
   if (!sock) {
     return res.status(503).json({ success: false, error: "WhatsApp não está conectado." });
@@ -636,13 +710,14 @@ app.all(["/set-offline", "/hide", "/invisible"], async (req, res) => {
   }
 });
 
-// 7. Rota de Resgate: Desconectar e Gerar Novo QR Code Automaticamente (Zero-Render)
+// 8. Rota de Resgate: Desconectar e Gerar Novo QR Code Automaticamente (Zero-Render)
 app.all(["/reset-session", "/force-new-qr", "/disconnect"], async (req, res) => {
   try {
     console.log("[Baileys] 🔄 Comando de RESET DE SESSÃO recebido via HTTP.");
     isConnected = false;
     connectedUser = null;
     currentQrCode = null;
+    cachedOrderGroupId = null;
 
     if (sock) {
       try {
@@ -670,7 +745,7 @@ app.all(["/reset-session", "/force-new-qr", "/disconnect"], async (req, res) => 
   }
 });
 
-// 8. Rota de Resgate: Forçar Reconexão Sem Perder a Sessão Salva
+// 9. Rota de Resgate: Forçar Reconexão Sem Perder a Sessão Salva
 app.all(["/reconnect", "/restart"], async (req, res) => {
   try {
     console.log("[Baileys] ⚡ Comando de RECONEXÃO recebido via HTTP.");
@@ -690,9 +765,10 @@ app.all(["/reconnect", "/restart"], async (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`=======================================================`);
-  console.log(`🥟 Servidor Baileys Croc & Cia v2.5 rodando na porta ${PORT}`);
+  console.log(`🥟 Servidor Baileys Croc & Cia v2.6 rodando na porta ${PORT}`);
   console.log(`👉 Status: http://localhost:${PORT}/status`);
   console.log(`👉 QR Code: http://localhost:${PORT}/qr`);
+  console.log(`👉 Grupos: http://localhost:${PORT}/groups`);
   console.log(`👉 Reset QR: http://localhost:${PORT}/reset-session`);
   console.log(`👉 Envio: POST http://localhost:${PORT}/send-message`);
   console.log(`=======================================================`);
